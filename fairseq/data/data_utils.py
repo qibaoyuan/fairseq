@@ -5,7 +5,12 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+try:
+    from collections.abc import Iterable
+except ImportError:
+    from collections import Iterable
 import contextlib
+import itertools
 import os
 
 import numpy as np
@@ -21,7 +26,7 @@ def infer_language_pair(path):
     return src, dst
 
 
-def collate_tokens(values, pad_idx, eos_idx, left_pad, move_eos_to_beginning=False):
+def collate_tokens(values, pad_idx, eos_idx=None, left_pad=False, move_eos_to_beginning=False):
     """Convert a list of 1d tensors into a padded 2d tensor."""
     size = max(v.size(0) for v in values)
     res = values[0].new(len(values), size).fill_(pad_idx)
@@ -40,13 +45,60 @@ def collate_tokens(values, pad_idx, eos_idx, left_pad, move_eos_to_beginning=Fal
     return res
 
 
+def load_indexed_dataset(path, dictionary, dataset_impl=None, combine=False, default='cached'):
+    """A helper function for loading indexed datasets.
+
+    Args:
+        path (str): path to indexed dataset (e.g., 'data-bin/train')
+        dictionary (~fairseq.data.Dictionary): data dictionary
+        dataset_impl (str, optional): which dataset implementation to use. If
+            not provided, it will be inferred automatically. For legacy indexed
+            data we use the 'cached' implementation by default.
+        combine (bool, optional): automatically load and combine multiple
+            datasets. For example, if *path* is 'data-bin/train', then we will
+            combine 'data-bin/train', 'data-bin/train1', ... and return a
+            single ConcatDataset instance.
+    """
+    from fairseq.data.concat_dataset import ConcatDataset
+    import fairseq.data.indexed_dataset as indexed_dataset
+
+    datasets = []
+    for k in itertools.count():
+        path_k = path + (str(k) if k > 0 else '')
+
+        dataset_impl_k = dataset_impl
+        if dataset_impl_k is None:
+            dataset_impl_k = indexed_dataset.infer_dataset_impl(path_k)
+
+        dataset = indexed_dataset.make_dataset(
+            path_k,
+            impl=dataset_impl_k or default,
+            fix_lua_indexing=True,
+            dictionary=dictionary,
+        )
+        if dataset is None:
+            break
+        print('| loaded {} examples from: {}'.format(len(dataset), path_k))
+        datasets.append(dataset)
+        if not combine:
+            break
+    if len(datasets) == 0:
+        return None
+    elif len(datasets) == 1:
+        return datasets[0]
+    else:
+        return ConcatDataset(datasets)
+
+
 @contextlib.contextmanager
-def numpy_seed(seed):
+def numpy_seed(seed, *addl_seeds):
     """Context manager which seeds the NumPy PRNG with the specified seed and
     restores the state afterward"""
     if seed is None:
         yield
         return
+    if len(addl_seeds) > 0:
+        seed = int(hash((seed, *addl_seeds)) % 1e6)
     state = np.random.get_state()
     np.random.seed(seed)
     try:
@@ -92,9 +144,19 @@ def filter_by_size(indices, size_fn, max_positions, raise_exception=False):
             assert isinstance(idx_size, dict)
             intersect_keys = set(max_positions.keys()) & set(idx_size.keys())
             return all(
-                idx_size[key] <= max_positions[key] for key in intersect_keys
+                all(a is None or b is None or a <= b
+                    for a, b in zip(idx_size[key], max_positions[key]))
+                for key in intersect_keys
             )
         else:
+            # Hacky as heck, for the specific case of multilingual training with RoundRobin.
+            if isinstance(size_fn(idx), dict) and isinstance(max_positions, tuple):
+                return all(a is None or b is None or a <= b
+                           for a, b in zip(size_fn(idx).values(), max_positions)
+                )
+            # For MultiCorpusSampledDataset, will generalize it later
+            if not isinstance(size_fn(idx), Iterable):
+                return all(size_fn(idx) <= b for b in max_positions)
             return all(a is None or b is None or a <= b
                        for a, b in zip(size_fn(idx), max_positions))
 
@@ -155,6 +217,10 @@ def batch_by_size(
     for idx in indices:
         sample_lens.append(num_tokens_fn(idx))
         sample_len = max(sample_len, sample_lens[-1])
+        assert sample_len <= max_tokens, (
+            "sentence at index {} of size {} exceeds max_tokens "
+            "limit of {}!".format(idx, sample_len, max_tokens)
+        )
         num_tokens = (len(batch) + 1) * sample_len
         if is_batch_full(num_tokens):
             mod_len = max(
@@ -170,3 +236,11 @@ def batch_by_size(
 
     if len(batch) > 0:
         yield batch
+
+
+def process_bpe_symbol(sentence: str, bpe_symbol: str):
+    if bpe_symbol == 'sentencepiece':
+        sentence = sentence.replace(' ', '').replace('\u2581', ' ').strip()
+    elif bpe_symbol is not None:
+        sentence = (sentence + ' ').replace(bpe_symbol, '').rstrip()
+    return sentence

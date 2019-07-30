@@ -5,6 +5,8 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+from itertools import chain
+
 import torch
 
 from fairseq import optim, utils
@@ -12,11 +14,15 @@ from fairseq import optim, utils
 
 class DynamicLossScaler(object):
 
-    def __init__(self, init_scale=2.**15, scale_factor=2., scale_window=2000, tolerance=0.05):
+    def __init__(
+        self, init_scale=2.**15, scale_factor=2., scale_window=2000,
+        tolerance=0.05, threshold=None,
+    ):
         self.loss_scale = init_scale
         self.scale_factor = scale_factor
         self.scale_window = scale_window
         self.tolerance = tolerance
+        self.threshold = threshold
         self._iter = 0
         self._last_overflow_iter = -1
         self._last_rescale_iter = -1
@@ -29,13 +35,18 @@ class DynamicLossScaler(object):
             self._overflows_since_rescale += 1
             pct_overflow = self._overflows_since_rescale / float(iter_since_rescale)
             if pct_overflow >= self.tolerance:
-                self.loss_scale /= self.scale_factor
+                self._decrease_loss_scale()
                 self._last_rescale_iter = self._iter
                 self._overflows_since_rescale = 0
         elif (self._iter - self._last_overflow_iter) % self.scale_window == 0:
             self.loss_scale *= self.scale_factor
             self._last_rescale_iter = self._iter
         self._iter += 1
+
+    def _decrease_loss_scale(self):
+        self.loss_scale /= self.scale_factor
+        if self.threshold is not None:
+            self.loss_scale = max(self.loss_scale, self.threshold)
 
     @staticmethod
     def has_overflow(grad_norm):
@@ -69,6 +80,7 @@ class FP16Optimizer(optim.FairseqOptimizer):
             init_scale=args.fp16_init_scale,
             scale_window=scale_window,
             tolerance=args.fp16_scale_tolerance,
+            threshold=args.threshold_loss_scale,
         )
 
     @classmethod
@@ -195,73 +207,33 @@ class FP16Optimizer(optim.FairseqOptimizer):
 
     def zero_grad(self):
         """Clears the gradients of all optimized parameters."""
-        self.fp32_optimizer.zero_grad()
         for p in self.params:
-            if p.grad is not None:
-                p.grad.detach_()
-                p.grad.zero_()
+            p.grad = None
         self._needs_sync = False
-
-
-class ConvertToFP32(object):
-    """
-    A wrapper around a list of params that will convert them to FP32 on the
-    first iteration, after which this essentially behaves like a normal list.
-    """
-
-    def __init__(self, params):
-
-        def convert_to_fp32(p):
-            p.data = p.data.float()
-            if p.grad is not None:
-                p.grad.data = p.grad.data.float()
-            return p
-
-        assert isinstance(params, list)
-        self.params = params
-        self.itr = map(convert_to_fp32, params)
-
-    @staticmethod
-    def wrap_optimizer_(optimizer):
-        for group in optimizer.param_groups:
-            group['params'] = ConvertToFP32(group['params'])
-
-    @staticmethod
-    def unwrap_optimizer_(optimizer):
-        for group in optimizer.param_groups:
-            group['params'] = group['params'].params  # unwrap from ConvertToFP32
-            for p in group['params']:
-                p.data = p.data.half()
-                if p.grad is not None:
-                    p.grad.data = p.grad.data.half()
-
-    def __len__(self):
-        return len(self.params)
-
-    def __iter__(self):
-        if self.itr is not None:
-            return self
-        else:
-            return iter(self.params)
-
-    def __next__(self):
-        try:
-            return next(self.itr)
-        except StopIteration:
-            self.itr = None
-            raise StopIteration
 
 
 class MemoryEfficientFP16Optimizer(optim.FairseqOptimizer):
     """
     Wrap an *optimizer* to support FP16 (mixed precision) training.
 
-    Compared to :class:`fairseq.optim.FP16Optimizer`, this version uses less
-    memory by copying between FP16 and FP32 parameters on-the-fly. The tradeoff
-    is reduced optimization speed, which can be mitigated with `--update-freq`.
+    Compared to :class:`fairseq.optim.FP16Optimizer`, this version does not
+    maintain an FP32 copy of the model. We instead expect the optimizer to
+    convert the gradients to FP32 internally and sync the results back to the
+    FP16 model params. This significantly reduces memory usage but slightly
+    increases the time spent in the optimizer.
+
+    Since this wrapper depends on specific functionality in the wrapped
+    optimizer (i.e., on-the-fly conversion of grads to FP32), only certain
+    optimizers can be wrapped. This is determined by the
+    *supports_memory_efficient_fp16* property.
     """
 
     def __init__(self, args, params, optimizer):
+        if not optimizer.supports_memory_efficient_fp16:
+            raise ValueError(
+                'Unsupported optimizer: {}'.format(optimizer.__class__.__name__)
+            )
+
         super().__init__(args, params)
         self.wrapped_optimizer = optimizer
 
@@ -279,6 +251,7 @@ class MemoryEfficientFP16Optimizer(optim.FairseqOptimizer):
             init_scale=args.fp16_init_scale,
             scale_window=scale_window,
             tolerance=args.fp16_scale_tolerance,
+            threshold=args.threshold_loss_scale,
         )
 
     @classmethod
@@ -321,9 +294,27 @@ class MemoryEfficientFP16Optimizer(optim.FairseqOptimizer):
         """
         if 'loss_scale' in state_dict:
             self.scaler.loss_scale = state_dict['loss_scale']
-        ConvertToFP32.wrap_optimizer_(self.wrapped_optimizer.optimizer)
+
         self.wrapped_optimizer.load_state_dict(state_dict, optimizer_overrides)
-        ConvertToFP32.unwrap_optimizer_(self.wrapped_optimizer.optimizer)
+
+        # Hack: PyTorch automatically casts the optimizer state to match the
+        # type of the current parameters. But with --memory-efficient-fp16 the
+        # params are FP16 while the optimizer state is FP32 and we don't want
+        # to cast. A workaround is to manually copy back the original state
+        # after the optimizer has been loaded.
+        groups = self.optimizer.param_groups
+        saved_groups = state_dict['param_groups']
+        id_map = {
+            old_id: p
+            for old_id, p in zip(
+                chain(*(g['params'] for g in saved_groups)),
+                chain(*(g['params'] for g in groups))
+            )
+        }
+        for k, v in state_dict['state'].items():
+            if k in id_map:
+                param = id_map[k]
+                self.optimizer.state[param] = v
 
     def backward(self, loss):
         """Computes the sum of gradients of the given tensor w.r.t. graph leaves.
@@ -376,14 +367,7 @@ class MemoryEfficientFP16Optimizer(optim.FairseqOptimizer):
     def step(self, closure=None):
         """Performs a single optimization step."""
         self._unscale_grads()
-
-        # convert params and grads to FP32 (lazily)
-        ConvertToFP32.wrap_optimizer_(self.wrapped_optimizer.optimizer)
-
         self.wrapped_optimizer.step(closure)
-
-        # convert params back to FP16
-        ConvertToFP32.unwrap_optimizer_(self.wrapped_optimizer.optimizer)
 
     def zero_grad(self):
         """Clears the gradients of all optimized parameters."""

@@ -8,8 +8,6 @@
 import numpy as np
 import torch
 
-from fairseq import utils
-
 from . import data_utils, FairseqDataset
 
 
@@ -90,8 +88,7 @@ class LanguagePairDataset(FairseqDataset):
         shuffle (bool, optional): shuffle dataset elements before batching
             (default: True).
         input_feeding (bool, optional): create a shifted version of the targets
-            to be passed into the model for input feeding/teacher forcing
-            (default: True).
+            to be passed into the model for teacher forcing (default: True).
         remove_eos_from_source (bool, optional): if set, removes eos from end
             of source if it's present (default: False).
         append_eos_to_target (bool, optional): if set, appends eos to end of
@@ -169,10 +166,10 @@ class LanguagePairDataset(FairseqDataset):
                   - `src_lengths` (LongTensor): 1D Tensor of the unpadded
                     lengths of each source sentence of shape `(bsz)`
                   - `prev_output_tokens` (LongTensor): a padded 2D Tensor of
-                    tokens in the target sentence, shifted right by one position
-                    for input feeding/teacher forcing, of shape `(bsz,
-                    tgt_len)`. This key will not be present if *input_feeding*
-                    is ``False``. Padding will appear on the left if
+                    tokens in the target sentence, shifted right by one
+                    position for teacher forcing, of shape `(bsz, tgt_len)`.
+                    This key will not be present if *input_feeding* is
+                    ``False``.  Padding will appear on the left if
                     *left_pad_target* is ``True``.
 
                 - `target` (LongTensor): a padded 2D Tensor of tokens in the
@@ -184,23 +181,6 @@ class LanguagePairDataset(FairseqDataset):
             left_pad_source=self.left_pad_source, left_pad_target=self.left_pad_target,
             input_feeding=self.input_feeding,
         )
-
-    def get_dummy_batch(self, num_tokens, max_positions, src_len=128, tgt_len=128):
-        """Return a dummy batch with a given number of tokens."""
-        src_len, tgt_len = utils.resolve_max_positions(
-            (src_len, tgt_len),
-            max_positions,
-            (self.max_source_positions, self.max_target_positions),
-        )
-        bsz = max(num_tokens // max(src_len, tgt_len), 1)
-        return self.collater([
-            {
-                'id': i,
-                'source': self.src_dict.dummy_sentence(src_len),
-                'target': self.tgt_dict.dummy_sentence(tgt_len) if self.tgt_dict is not None else None,
-            }
-            for i in range(bsz)
-        ])
 
     def num_tokens(self, index):
         """Return the number of tokens in a sample. This value is used to
@@ -227,9 +207,10 @@ class LanguagePairDataset(FairseqDataset):
     def supports_prefetch(self):
         return (
             getattr(self.src, 'supports_prefetch', False)
-            and getattr(self.tgt, 'supports_prefetch', False)
+            and (getattr(self.tgt, 'supports_prefetch', False) or self.tgt is None)
         )
 
     def prefetch(self, indices):
         self.src.prefetch(indices)
-        self.tgt.prefetch(indices)
+        if self.tgt is not None:
+            self.tgt.prefetch(indices)

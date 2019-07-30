@@ -5,6 +5,7 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+import numpy as np
 import torch.utils.data
 
 
@@ -21,15 +22,11 @@ class FairseqDataset(torch.utils.data.Dataset):
         """Merge a list of samples to form a mini-batch.
 
         Args:
-            samples (List[int]): sample indices to collate
+            samples (List[dict]): samples to collate
 
         Returns:
             dict: a mini-batch suitable for forwarding with a Model
         """
-        raise NotImplementedError
-
-    def get_dummy_batch(self, num_tokens, max_positions):
-        """Return a dummy batch with a given number of tokens."""
         raise NotImplementedError
 
     def num_tokens(self, index):
@@ -45,7 +42,7 @@ class FairseqDataset(torch.utils.data.Dataset):
     def ordered_indices(self):
         """Return an ordered list of indices. Batches will be constructed based
         on this order."""
-        raise NotImplementedError
+        return np.arange(len(self))
 
     @property
     def supports_prefetch(self):
